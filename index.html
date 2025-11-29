@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Orbit Collector — Rewritten (Compact & Safe)</title>
+<style>
+  :root{--bg:#07070a;--panel:rgba(255,255,255,0.06)}
+  html,body{height:100%;margin:0;background:var(--bg);font-family:system-ui,-apple-system,Segoe UI,Roboto,"Hiragino Kaku Gothic ProN";color:#fff}
+  .wrap{display:flex;gap:16px;align-items:flex-start;padding:18px}
+  canvas{border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,.6);background:linear-gradient(180deg,#05060a,#0b0b10)}
+  .panel{width:340px;padding:12px;border-radius:10px;background:var(--panel)}
+  h3{margin:0 0 8px 0;font-size:16px}
+  .row{margin:10px 0;font-size:13px}
+  label{display:block;margin-bottom:6px;opacity:.9}
+  input[type="range"]{width:100%}
+  .hud{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+  .stat{background:rgba(255,255,255,0.04);padding:8px;border-radius:8px}
+  .big{font-size:20px;font-weight:700}
+  .muted{opacity:.85;font-size:12px}
+  .targetBox{display:flex;align-items:center;gap:8px;padding:6px;border-radius:8px;background:rgba(255,255,255,0.03)}
+  .colorPatch{width:44px;height:34px;border-radius:6px;box-shadow:0 2px 6px rgba(0,0,0,.6)}
+  .btn{padding:8px 12px;border-radius:8px;background:#2b2bff;border:none;color:#fff;cursor:pointer}
+  .tip{font-size:13px;background:rgba(255,255,255,0.02);padding:8px;border-radius:8px}
+  .overlay{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,0.6)}
+  .card{background:#0d0d12;padding:18px;border-radius:12px;text-align:center}
+  .small{font-size:12px;opacity:.85}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <canvas id="c"></canvas>
+
+  <div class="panel">
+    <h3>Orbit Collector — Rewritten</h3>
+
+    <div class="hud">
+      <div class="stat">
+        <div class="muted">Score</div>
+        <div id="score" class="big">0</div>
+      </div>
+      <div class="stat">
+        <div class="muted">Time</div>
+        <div id="time" class="big">20</div>
+      </div>
+      <div class="stat">
+        <div class="muted">Combo</div>
+        <div id="combo" class="big">0</div>
+      </div>
+    </div>
+
+    <div class="targetBox">
+      <div style="flex:1">
+        <div class="muted">Target</div>
+        <div id="targetLabel" style="font-weight:700">赤</div>
+      </div>
+      <div id="targetPatch" class="colorPatch"></div>
+    </div>
+
+    <div class="tip" style="margin-top:10px">
+      操作: クリック／タッチ／Space を押し続けてチャージ → 離すとパルス発射。チャージが大きいほど波紋が強力で捕まえやすい。
+    </div>
+
+    <div class="row" style="margin-top:12px">
+      <button id="start" class="btn">Start</button>
+      <button id="reset" class="btn" style="background:#666;margin-left:8px">Reset</button>
+    </div>
+
+    <div class="row">
+      <label>Particles: <span id="countLbl">40</span></label>
+      <input id="count" type="range" min="6" max="120" value="40">
+    </div>
+    <div class="row">
+      <label>Trail length: <span id="trailLbl">14</span></label>
+      <input id="trail" type="range" min="0" max="60" value="14">
+    </div>
+    <div class="row">
+      <label>Capture radius: <span id="capLbl">34</span></label>
+      <input id="cap" type="range" min="8" max="160" value="34">
+    </div>
+
+    <div class="row small" style="margin-top:6px">
+      注: 中心は画面内に固定されています。リサイズしても外に出ません。
+    </div>
+  </div>
+</div>
+
+<div id="overlay" class="overlay"><div class="card"><div style="font-size:20px">Game Over</div><div id="final" style="margin:8px 0"></div><button id="again" class="btn">Play Again</button></div></div>
+
+<script>
+/* ====== 定数 ====== */
+const GAME_TIME = 20;
+const MAX_CHARGE = 1.4;
+const PULSE_VIS = 0.6;
+const BASE_RANGE = 80;
+const RANGE_MULT = 3.2;
+const BASE_STUN = 0.6;
+const STUN_MULT = 1.8;
+const HUE_BANDS = [10,70,150,220,300];
+
+/* ====== DOM ====== */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const startBtn = document.getElementById('start');
+const resetBtn = document.getElementById('reset');
+const scoreEl = document.getElementById('score');
+const timeEl = document.getElementById('time');
+const comboEl = document.getElementById('combo');
+const targetPatch = document.getElementById('targetPatch');
+const targetLabel = document.getElementById('targetLabel');
+const overlay = document.getElementById('overlay');
+const finalEl = document.getElementById('final');
+const againBtn = document.getElementById('again');
+
+const countInput = document.getElementById('count');
+const trailInput = document.getElementById('trail');
+const capInput = document.getElementById('cap');
+const countLbl = document.getElementById('countLbl');
+const trailLbl = document.getElementById('trailLbl');
+const capLbl = document.getElementById('capLbl');
+
+/* ====== 状態 ====== */
+let DPR = Math.min(window.devicePixelRatio || 1, 2);
+let center = { x: 0, y: 0 };
+let params = {
+  count: Number(countInput.value),
+  trail: Number(trailInput.value),
+  capture: Number(capInput.value)
+};
+let particles = [];
+let pulses = [];
+let fx = [];
+let game = { running:false, timeLeft:GAME_TIME, score:0, combo:0, bestCombo:0 };
+
+/* 入力 */
+let holding = false;
+let holdStart = 0;
+let currentCharge = 0;
+
+/* ターゲット */
+let targetHue = 0;
+let targetName = '';
+
+/* util */
+const rand = (a,b) => Math.random() * (b - a) + a;
+const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+const hueToHsl = (h,s=82,l=55) => `hsl(${h} ${s}% ${l}%)`;
+const hueDist = (a,b) => { const d = Math.abs(a-b) % 360; return Math.min(d, 360-d); };
+
+/* ====== canvas / resize ====== */
+function fitCanvas(){
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  const size = Math.min(window.innerWidth - 360, window.innerHeight - 40);
+  const px = Math.max(Math.min(size, 900), 300);
+  canvas.style.width = px + 'px';
+  canvas.style.height = px + 'px';
+  canvas.width = Math.floor(px * DPR);
+  canvas.height = Math.floor(px * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  if(!game.running){
+    center.x = canvas.clientWidth / 2;
+    center.y = canvas.clientHeight / 2;
+  }
+  clampCenter();
+}
+window.addEventListener('resize', fitCanvas);
+fitCanvas();
+
+function clampCenter(pad = 8) {
+  const left = pad;
+  const top = pad;
+  const right = canvas.clientWidth - pad;
+  const bottom = canvas.clientHeight - pad;
+  center.x = clamp(center.x, left, right);
+  center.y = clamp(center.y, top, bottom);
+}
+
+/* ====== Particle ====== */
+class Particle {
+  constructor(orbit, angle, angVel, size, hue) {
+    this.orbit = orbit;
+    this.angle = angle;
+    this.angVel = angVel;
+    this.size = size;
+    this.hue = hue;
+    this.history = [];
+    this.pulled = 0;
+    this.captured = false; // 二重捕獲防止
+  }
+  step(dt) {
+    if(this.pulled > 0){
+      this.pulled = Math.max(0, this.pulled - dt);
+      this.angle += this.angVel * dt * 0.16;
+    } else {
+      this.angle += this.angVel * dt;
+    }
+    const x = center.x + Math.cos(this.angle) * this.orbit;
+    const y = center.y + Math.sin(this.angle) * this.orbit;
+    this.history.push({x,y});
+    if(this.history.length > Math.max(1, params.trail)) this.history.shift();
+  }
+  draw(ctx) {
+    const last = this.history[this.history.length - 1] || {x:center.x,y:center.y};
+    if(this.pulled > 0){
+      const a = clamp(this.pulled / (BASE_STUN + STUN_MULT), 0, 1);
+      ctx.beginPath();
+      ctx.strokeStyle = `hsla(${this.hue} 95% 70% / ${0.95*a})`;
+      ctx.lineWidth = 2 + 4*a;
+      ctx.arc(last.x, last.y, this.size*3 + 8*a, 0, Math.PI*2);
+      ctx.stroke();
+    }
+    if(this.history.length > 1){
+      ctx.lineWidth = Math.max(1, this.size*0.9);
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      for(let i=0;i<this.history.length-1;i++){
+        const a = this.history[i], b = this.history[i+1];
+        const t = i/(this.history.length-1);
+        ctx.strokeStyle = `hsla(${this.hue} 78% 54% / ${0.9*Math.pow(t,1.05)})`;
+        ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+      }
+    }
+    ctx.beginPath();
+    ctx.fillStyle = hueToHsl(this.hue);
+    ctx.arc(last.x, last.y, this.size, 0, Math.PI*2);
+    ctx.fill();
+  }
+}
+
+/* ====== 生成 ====== */
+function spawnParticles(n){
+  particles = [];
+  const minDim = Math.min(canvas.clientWidth, canvas.clientHeight);
+  const base = minDim * 0.06;
+  const maxR = minDim * 0.26;
+  for(let i=0;i<n;i++){
+    const t = i / Math.max(1, n-1);
+    const orbit = base + t * (maxR - base) * (1 + rand(-0.04,0.04));
+    const angle = rand(0, Math.PI*2);
+    const angVel = (0.6 + (1 - t) * 1.4) * (Math.random()>0.5?1:-1) * (0.6 + rand(0,0.6));
+    const size = Math.max(0.9, 3.2 - t*2.6);
+    const band = Math.floor(rand(0, HUE_BANDS.length));
+    const hue = Math.floor(HUE_BANDS[band] + rand(-18,18));
+    const p = new Particle(orbit, angle, angVel, size, hue);
+    for(let k=0;k<Math.min(6, params.trail);k++) p.history.push({x:center.x,y:center.y});
+    particles.push(p);
+  }
+}
+
+/* ====== ターゲット選択 ====== */
+function chooseTarget(){
+  const idx = Math.floor(rand(0, HUE_BANDS.length));
+  targetHue = HUE_BANDS[idx] + Math.floor(rand(-10,10));
+  const names = ['赤','黄','緑','青','紫'];
+  targetName = names[idx] || '色';
+  targetLabel.textContent = targetName;
+  targetPatch.style.background = hueToHsl(targetHue, 88, 56);
+}
+
+/* ====== 発射 ====== */
+function firePulse(charge){
+  if(!game.running || game.timeLeft <= 0) return;
+  const range = BASE_RANGE * (1 + RANGE_MULT * charge);
+  const power = 1 + 3.2 * charge;
+  const stun = BASE_STUN + STUN_MULT * charge;
+  pulses.push({x:center.x, y:center.y, t:0, range, power, stun});
+}
+
+/* ====== 捕獲判定（厳密化） ====== */
+function tryCapture(p){
+  if(p.captured) return {capturable:false};
+  const pos = p.history[p.history.length-1];
+  if(!pos) return {capturable:false};
+  const d = Math.hypot(pos.x - center.x, pos.y - center.y);
+  const inR = d <= params.capture;
+  if(!inR) return {capturable:false};
+  const extremelyClose = d <= Math.max(8, params.capture * 0.35);
+  const wasPulled = p.pulled > 0.12; // 有意なpullであることを要求
+  const hueDelta = hueDist(p.hue, targetHue);
+  const match = hueDelta <= 22; // ほどよく厳しめ
+  if((wasPulled || extremelyClose) && inR) return {capturable:true, match, pos};
+  return {capturable:false};
+}
+
+/* ====== キャプチャ処理 ====== */
+function captureIndex(i, match, pos){
+  const p = particles[i];
+  // 二重捕獲防止フラグ（念のため）
+  p.captured = true;
+  particles.splice(i,1);
+  if(match){
+    const base = 14;
+    const bonus = Math.floor(game.combo * 4);
+    const pts = base + bonus;
+    game.score = Math.round(game.score + pts);
+    game.combo++; game.bestCombo = Math.max(game.bestCombo, game.combo);
+    // 視覚効果
+    for(let k=0;k<10;k++) fx.push({x:pos.x+rand(-6,6), y:pos.y+rand(-6,6), h:p.hue, life:0.6});
+    fx.push({x:pos.x, y:pos.y-10, text:`+${pts}`, life:0.9, type:'text', big:true});
+  } else {
+    const penalty = 6; // ちょい緩和
+    game.score = Math.max(0, Math.round(game.score - penalty));
+    game.combo = 0;
+    // ミスの視覚フィードバック（控えめ）
+    for(let k=0;k<6;k++) fx.push({x:pos.x+rand(-4,4), y:pos.y+rand(-4,4), h:0, life:0.5});
+    fx.push({x:pos.x, y:pos.y-10, text:`-${penalty}`, life:0.9, type:'text'});
+  }
+  updateUI();
+}
+
+// ====== メインループ ======
+let last = performance.now();
+function loop(now){
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+
+  if(game.running){
+    game.timeLeft -= dt;
+    if(game.timeLeft <= 0){
+      game.timeLeft = 0;
+      endGame();
+    }
+    // ここで毎フレーム UI を更新する（Time 表示が更新されない問題の修正）
+    // score/combo は頻繁に更新する必要はないが、time は毎フレームで更新した方が自然
+    timeEl.textContent = Math.ceil(game.timeLeft);
+  }
+
+  if(holding) {
+    currentCharge = clamp((performance.now() - holdStart) / 1000 / MAX_CHARGE, 0, 1);
+  } else {
+    currentCharge = 0;
+  }
+
+
+
+  ctx.clearRect(0,0,canvas.clientWidth, canvas.clientHeight);
+
+  // charge ring
+  if(currentCharge > 0){
+    const r = 18 + currentCharge * 70;
+    ctx.beginPath();
+    ctx.strokeStyle = `rgba(140,200,255,${0.55 + 0.45*currentCharge})`;
+    ctx.lineWidth = 2 + 6*currentCharge;
+    ctx.arc(center.x, center.y, r, 0, Math.PI*2);
+    ctx.stroke();
+  }
+
+  // pulses 描画 & 効果
+  for(let i=pulses.length-1;i>=0;i--){
+    const pul = pulses[i];
+    pul.t += dt;
+    const prog = pul.t / PULSE_VIS;
+    const alpha = clamp(1 - prog, 0, 1);
+    ctx.beginPath();
+    ctx.strokeStyle = `rgba(140,180,255,${0.95 * alpha})`;
+    ctx.lineWidth = 2 + 6*(1-prog);
+    ctx.arc(pul.x, pul.y, pul.range * prog, 0, Math.PI*2);
+    ctx.stroke();
+    if(pul.t > PULSE_VIS) pulses.splice(i,1);
+  }
+
+  // pulses 効果（引き寄せとpulled）
+  for(const pul of pulses){
+    for(const p of particles){
+      const lastPos = p.history[p.history.length-1] || {x:center.x, y:center.y};
+      const d = Math.hypot(lastPos.x - pul.x, lastPos.y - pul.y);
+      if(d < pul.range){
+        const factor = (1 - (d / pul.range)) * pul.power;
+        const shrink = factor * 260 * dt;
+        p.orbit = Math.max(4, p.orbit - shrink);
+        p.pulled = Math.max(p.pulled, pul.stun * factor);
+        p.angVel *= Math.max(0.12, 1 - 0.22 * factor);
+      }
+    }
+  }
+
+  // 粒子更新・描画・捕獲
+  for(let i=particles.length-1;i>=0;i--){
+    const p = particles[i];
+    p.step(dt);
+    p.draw(ctx);
+    if(game.running){
+      const res = tryCapture(p);
+      if(res.capturable) captureIndex(i, res.match, res.pos);
+    }
+  }
+
+  // fx（エフェクト）描画。textタイプに対応
+  for(let i=fx.length-1;i>=0;i--){
+    const e = fx[i];
+    e.life -= dt;
+    if(e.life <= 0) { fx.splice(i,1); continue; }
+    if(e.type === 'text' && e.text){
+      ctx.globalAlpha = clamp(e.life / 0.9, 0, 1);
+      ctx.font = (e.big ? 'bold 18px system-ui, -apple-system' : '14px system-ui, -apple-system');
+      ctx.textAlign = 'center';
+      ctx.fillStyle = e.text.startsWith('+') ? 'lime' : 'salmon';
+      ctx.fillText(e.text, e.x, e.y - (1-e.life)*20);
+      ctx.globalAlpha = 1;
+      continue;
+    }
+    ctx.globalAlpha = clamp(e.life / 0.6, 0, 1);
+    ctx.beginPath();
+    ctx.fillStyle = `hsl(${e.h} 88% 60%)`;
+    ctx.arc(e.x, e.y, Math.max(1, 6*e.life), 0, Math.PI*2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  requestAnimationFrame(loop);
+}
+
+/* ====== UI / ゲーム ====== */
+function updateUI(){
+  scoreEl.textContent = Math.round(game.score);
+  timeEl.textContent = Math.ceil(game.timeLeft);
+  comboEl.textContent = game.combo;
+}
+function startGame(){
+  game.running = true;
+  game.timeLeft = GAME_TIME;
+  game.score = 0;
+  game.combo = 0;
+  game.bestCombo = 0;
+  spawnParticles(params.count);
+  chooseTarget();
+  overlay.style.display = 'none';
+  updateUI();
+  last = performance.now();
+}
+function endGame(){
+  game.running = false;
+  finalEl.textContent = `Score: ${Math.round(game.score)}   Best Combo: ${game.bestCombo}`;
+  overlay.style.display = 'flex';
+}
+
+/* ====== 入力 ====== */
+canvas.addEventListener('mousedown', (e) => {
+  const r = canvas.getBoundingClientRect();
+  center.x = e.clientX - r.left;
+  center.y = e.clientY - r.top;
+  clampCenter();
+  holding = true; holdStart = performance.now();
+});
+window.addEventListener('mouseup', (e) => {
+  if(holding){
+    const hold = (performance.now() - holdStart)/1000;
+    const charge = clamp(hold / MAX_CHARGE, 0, 1);
+    firePulse(charge);
+  }
+  holding = false;
+});
+canvas.addEventListener('mousemove', (e) => {
+  if(holding){
+    const r = canvas.getBoundingClientRect();
+    center.x += ((e.clientX - r.left) - center.x) * 0.22;
+    center.y += ((e.clientY - r.top) - center.y) * 0.22;
+    clampCenter();
+  }
+});
+canvas.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  const t = e.touches[0];
+  const r = canvas.getBoundingClientRect();
+  center.x = t.clientX - r.left;
+  center.y = t.clientY - r.top;
+  clampCenter();
+  holding = true; holdStart = performance.now();
+}, {passive:false});
+window.addEventListener('touchend', (e) => {
+  if(holding){
+    const hold = (performance.now() - holdStart)/1000;
+    const charge = clamp(hold / MAX_CHARGE, 0, 1);
+    firePulse(charge);
+  }
+  holding = false;
+});
+canvas.addEventListener('touchmove', (e) => {
+  if(holding){
+    e.preventDefault();
+    const t = e.touches[0];
+    const r = canvas.getBoundingClientRect();
+    center.x += ((t.clientX - r.left) - center.x) * 0.22;
+    center.y += ((t.clientY - r.top) - center.y) * 0.22;
+    clampCenter();
+  }
+}, {passive:false});
+
+let spaceDown = false;
+window.addEventListener('keydown', (e) => {
+  if(e.code === 'Space' && !spaceDown){
+    spaceDown = true; holding = true; holdStart = performance.now(); e.preventDefault();
+  }
+});
+window.addEventListener('keyup', (e) => {
+  if(e.code === 'Space' && spaceDown){
+    const hold = (performance.now() - holdStart)/1000;
+    const charge = clamp(hold / MAX_CHARGE, 0, 1);
+    firePulse(charge);
+    spaceDown = false; holding = false; e.preventDefault();
+  }
+});
+
+/* ====== UI イベント ====== */
+startBtn.addEventListener('click', startGame);
+resetBtn.addEventListener('click', () => { game.running = false; overlay.style.display = 'none'; spawnParticles(params.count); updateUI(); });
+againBtn.addEventListener('click', () => { startGame(); });
+
+countInput.addEventListener('input', () => { params.count = Number(countInput.value); countLbl.textContent = params.count; });
+trailInput.addEventListener('input', () => { params.trail = Number(trailInput.value); trailLbl.textContent = params.trail; });
+capInput.addEventListener('input', () => { params.capture = Number(capInput.value); capLbl.textContent = params.capture; });
+
+/* ====== 初期化 ====== */
+countLbl.textContent = params.count;
+trailLbl.textContent = params.trail;
+capLbl.textContent = params.capture;
+spawnParticles(params.count);
+chooseTarget();
+updateUI();
+requestAnimationFrame(loop);
+
+</script>
+</body>
+</html>
